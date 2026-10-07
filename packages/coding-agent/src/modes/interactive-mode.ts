@@ -231,7 +231,6 @@ export function resolveActivityIndicatorMessage(
 }
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
 const COMPOSER_RIGHT_GUTTER_WIDTH = 1;
-const GRACEFUL_SHUTDOWN_RENDER_COMMIT_TIMEOUT_MS = 1000;
 
 const IRC_SIDEBAR_TOGGLE_SHADOWING_ACTIONS: readonly AppKeybinding[] = [
 	"app.plan.toggle",
@@ -566,6 +565,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	#suspendedActivityIndicator?: Loader;
 	#stopped = false;
 	#initPromise?: Promise<void>;
+	// Until startup's first paint renders the session transcript, chatContainer holds
+	// only pre-paint notices. A transcript rebuild before then (e.g. an extension
+	// session_start message with display:true) would wipe those notices and leave
+	// session components that the first paint preserves and renders again, so every
+	// session-derived block would show twice. Rebuilds are no-ops until the first
+	// paint, which renders the full session anyway.
+	#initialTranscriptPainted = false;
 	#stopListeners = new Set<() => void>();
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
@@ -1556,51 +1562,18 @@ export class InteractiveMode implements InteractiveModeContext {
 			getComposerBottomOffset: () =>
 				this.petFloorContainer.render(this.ui.terminal.columns).length +
 				this.hookWidgetContainerBelow.render(this.ui.terminal.columns).length,
-			syncManagedItermCursor: (row, column, signal) =>
-				this.#itermPetTransport?.refreshManagedClient(row, column, signal) ?? Promise.resolve(false),
+			syncManagedItermCursor: (row, column) =>
+				this.#itermPetTransport?.refreshManagedClient(row, column) ?? Promise.resolve(false),
 		});
 	}
 
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void {
-		const preservedStreamingAssistant = this.#detachStreamingAssistantForRebuild(policy);
+		if (!this.#initialTranscriptPainted) return;
 		prepareTranscriptRebuild(this.ui, policy);
 		this.resetAssistantTextPresentation();
 		this.chatContainer.clear();
 		const context = this.session.buildDisplaySessionContext();
 		this.renderSessionContext(context);
-		this.#restoreStreamingAssistantAfterRebuild(preservedStreamingAssistant);
-	}
-
-	#detachStreamingAssistantForRebuild(
-		policy: TranscriptRebuildPolicy,
-	): { component: AssistantMessageComponent; message: AssistantMessage } | undefined {
-		const component =
-			policy === "reconcile-same-transcript" &&
-			this.streamingComponent &&
-			this.streamingMessage &&
-			this.chatContainer.hasLiveChild(this.streamingComponent)
-				? this.streamingComponent
-				: undefined;
-		if (!component || !this.streamingMessage) return undefined;
-		if (getSessionMessageEntryId(this.streamingMessage)) {
-			this.streamingComponent = undefined;
-			this.streamingMessage = undefined;
-			return undefined;
-		}
-		// A live provider response is not persisted until message_end. Detach it before
-		// clear() so same-transcript rebuilds cannot dispose pending text-frame ownership.
-		this.chatContainer.detachChild(component);
-		return { component, message: this.streamingMessage };
-	}
-
-	#restoreStreamingAssistantAfterRebuild(
-		preserved: { component: AssistantMessageComponent; message: AssistantMessage } | undefined,
-	): void {
-		if (!preserved) return;
-		this.streamingComponent = preserved.component;
-		this.streamingMessage = preserved.message;
-		addChatChild(this, preserved.component);
-		this.#eventController.rebindAssistantTextPresentation();
 	}
 
 	#sanitizeTodoText(text: string): string {
@@ -1844,13 +1817,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		if (this.isInitialized) {
-			const finalRenderGeneration = this.ui.requestRenderWithGeneration(true, "shutdown");
-			// A scheduled frame is not necessarily painted: raster ingress may still
-			// own the terminal queue. Wait for the exact forced generation to commit
-			// before stop() advances the lifecycle fence, but keep terminal restoration
-			// bounded if a raster producer is permanently stuck.
-			await this.ui.waitForRenderCommit(finalRenderGeneration, GRACEFUL_SHUTDOWN_RENDER_COMMIT_TIMEOUT_MS);
+			this.ui.requestRender(true);
 		}
+
+		// Wait for any pending renders to complete
+		// requestRender() uses process.nextTick(), so we wait one tick
+		await new Promise(resolve => process.nextTick(resolve));
 
 		// Drain any in-flight Kitty key release events before stopping.
 		// This prevents escape sequences from leaking to the parent shell over slow SSH.
@@ -2217,16 +2189,16 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	rebuildInitialMessages(
 		policy: TranscriptRebuildPolicy,
-		rebuiltContext?: SessionContext,
+		prebuiltContext?: SessionContext,
 		options?: { preserveExistingChat?: boolean },
 	): void {
-		const preservedStreamingAssistant = this.#detachStreamingAssistantForRebuild(policy);
+		if (!this.#initialTranscriptPainted) return;
 		prepareTranscriptRebuild(this.ui, policy);
-		this.#uiHelpers.renderInitialMessages(rebuiltContext, options);
-		this.#restoreStreamingAssistantAfterRebuild(preservedStreamingAssistant);
+		this.#uiHelpers.renderInitialMessages(prebuiltContext, options);
 	}
 	renderInitialMessages(prebuiltContext?: SessionContext, options?: { preserveExistingChat?: boolean }): void {
 		this.#uiHelpers.renderInitialMessages(prebuiltContext, options);
+		this.#initialTranscriptPainted = true;
 	}
 
 	getUserMessageText(message: Message): string {
@@ -2668,6 +2640,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	handleBackgroundCommand(): void {
 		this.#inputController.handleBackgroundCommand();
+	}
+
+	maybeGenerateSessionTitle(text: string): void {
+		this.#inputController.maybeGenerateSessionTitle(text);
 	}
 
 	handleImagePaste(): Promise<boolean> {
