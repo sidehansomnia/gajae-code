@@ -29,30 +29,47 @@ function sameFixturePath(left: string, right: string): boolean {
 	return normalize(left) === normalize(right);
 }
 
+async function cleanupFixtureRoots() {
+	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+}
+
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.nativeExactRemovalProbe = undefined;
-	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+	await cleanupFixtureRoots();
 });
 
-async function signedIdentityFixture(component: "root" | "info" | "both", detach = false) {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-signed-id-"));
-	roots.push(root);
-	const file = path.join(root, "index.jsonl");
-	const lock = `${file}.lock`;
+async function signedIdentityFixture(component: "root" | "info" | "both", detach = false, tempRoot = os.tmpdir()) {
+	const cleanupRoot = await fs.mkdtemp(path.join(tempRoot, "file-lock-signed-id-"));
+	// The cleanup guard uses realpathSync, which preserves Windows short names.
+	// Retain mkdtemp's spelling for cleanup against that captured temp boundary.
+	roots.push(cleanupRoot);
+	// Exact removal resolves parent aliases before re-reading stat identity.
+	// Keep the fixture's path-matched stat spies on that same canonical path.
+	const root = await fs.realpath(cleanupRoot);
+	// Acquisition cleans staging paths using the caller's spelling too.
+	const file = path.join(cleanupRoot, "index.jsonl");
+	const cleanupLock = `${file}.lock`;
+	const cleanupParked = `${cleanupLock}.removing`;
+	const lock = path.join(root, "index.jsonl.lock");
 	const parked = `${lock}.removing`;
 	await fs.mkdir(lock);
 	await Bun.write(path.join(lock, "info"), JSON.stringify({ pid: DEAD_PID, timestamp: 1000 }));
 	let nativeIdentityChanged = false;
-	const pathObservations: string[] = [];
 	const realLstat = fs.lstat;
 	const transformStat = (target: string, stat: BigIntStats): BigIntStats => {
 		const isRoot =
-			sameFixturePath(target, lock) || sameFixturePath(target, parked) || (detach && sameFixturePath(target, root));
+			sameFixturePath(target, lock) ||
+			sameFixturePath(target, parked) ||
+			sameFixturePath(target, cleanupLock) ||
+			sameFixturePath(target, cleanupParked) ||
+			(detach && (sameFixturePath(target, root) || sameFixturePath(target, cleanupRoot)));
 		const isInfo =
-			sameFixturePath(target, path.join(lock, "info")) || sameFixturePath(target, path.join(parked, "info"));
-		pathObservations.push(`stat ${String(target)} root=${isRoot} info=${isInfo} dev=${stat.dev} ino=${stat.ino}`);
+			sameFixturePath(target, path.join(lock, "info")) ||
+			sameFixturePath(target, path.join(parked, "info")) ||
+			sameFixturePath(target, path.join(cleanupLock, "info")) ||
+			sameFixturePath(target, path.join(cleanupParked, "info"));
 		const id = isRoot && component !== "info" ? ROOT_ID : isInfo && component !== "root" ? INFO_ID : null;
 		if (!isRoot && !isInfo) return stat;
 		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
@@ -67,9 +84,10 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	const realOpen = fs.open;
 	vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
 		const handle = await realOpen(target, flags, mode);
-		const matchesInfo = sameFixturePath(String(target), path.join(lock, "info"));
-		pathObservations.push(`open ${String(target)} info=${matchesInfo}`);
-		if (matchesInfo) {
+		if (
+			sameFixturePath(String(target), path.join(lock, "info")) ||
+			sameFixturePath(String(target), path.join(cleanupLock, "info"))
+		) {
 			const realStat = handle.stat.bind(handle);
 			vi.spyOn(handle, "stat").mockImplementation((async options => {
 				const stat = await realStat(options);
@@ -94,25 +112,31 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		})),
 	});
 	const originals = new Map<string, NativeDirectoryTreeSnapshot>();
-	const remove = vi.fn((target: string, snapshot: NativeDirectoryTreeSnapshot, parent?: { ino: bigint }) => {
-		const original = originals.get(target);
-		if (!original) throw new Error("Removal without captured authority");
-		expect(snapshot).toEqual(nativeSnapshot(original));
-		if (detach) {
-			expect(parent?.ino).toBe(ROOT_ID);
-			renameSync(target, parked);
-			return { ok: true, detachedPath: parked };
-		}
-		// Only simulate the native commit after both the adapted authority and
-		// the original filesystem generation match the captured snapshot.
-		expect(snapshotDirectoryTree(target).snapshot).toEqual(original);
-		rmSync(target, { recursive: true, force: true });
-		return { ok: true };
-	});
+	const remove = vi.fn(
+		(
+			target: string,
+			snapshot: NativeDirectoryTreeSnapshot,
+			parentIdentity?: { dev: bigint; ino: bigint },
+			_detachOnly?: boolean,
+		) => {
+			const original = originals.get(target);
+			if (!original) throw new Error("Removal without captured authority");
+			expect(snapshot).toEqual(nativeSnapshot(original));
+			if (detach) {
+				expect(parentIdentity?.ino).toBe(ROOT_ID);
+				renameSync(target, cleanupParked);
+				return { ok: true, detachedPath: cleanupParked };
+			}
+			// Only simulate the native commit after both the adapted authority and
+			// the original filesystem generation match the captured snapshot.
+			expect(snapshotDirectoryTree(target).snapshot).toEqual(original);
+			rmSync(target, { recursive: true, force: true });
+			return { ok: true };
+		},
+	);
 	FileLockTestHooks.nativeExactRemovalProbe = () => !detach;
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: target => {
-			pathObservations.push(`snapshot ${target}`);
 			const captured = snapshotDirectoryTree(target);
 			if (!captured.ok || !captured.snapshot) return captured;
 			originals.set(target, captured.snapshot);
@@ -125,7 +149,6 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		lock,
 		parked,
 		remove,
-		pathObservations,
 		changeNativeIdentity: () => {
 			nativeIdentityChanged = true;
 		},
@@ -136,11 +159,7 @@ test.each(["root", "info"] as const)("reclaims a dead-owner lock with a signed %
 	const fixture = await signedIdentityFixture(component);
 	const observed = await readFileLockObservationForGc(fixture.lock);
 	if (!observed) throw new Error("Expected a lock observation");
-	const result = await removeFileLockDirForGc(fixture.lock, observed.info, observed.identity);
-	if (result !== "removed")
-		throw new Error(
-			JSON.stringify({ result, identity: observed.identity, paths: fixture.pathObservations }, null, 2),
-		);
+	expect(await removeFileLockDirForGc(fixture.lock, observed.info, observed.identity)).toBe("removed");
 	expect(fixture.remove).toHaveBeenCalledTimes(1);
 	expect(await fs.exists(fixture.lock)).toBe(false);
 });
@@ -152,6 +171,41 @@ test("acquires and releases after reclaiming a signed-ID dead-owner lock", async
 	);
 	expect(await fs.exists(fixture.lock)).toBe(false);
 });
+
+test.skipIf(process.platform !== "win32")(
+	"reclaims signed IDs and cleans up through a temporary-root case alias when available",
+	async () => {
+		const tempRoot = os.tmpdir();
+		const volumeRoot = path.win32.parse(tempRoot).root;
+		const isDriveRoot = /^[a-z]:[\\/]/i.test(volumeRoot);
+		const aliasOffset = tempRoot.slice(volumeRoot.length).search(/[a-z]/i);
+		const caseableOffset = isDriveRoot ? 0 : aliasOffset < 0 ? -1 : volumeRoot.length + aliasOffset;
+		let aliasedTempRoot = tempRoot;
+		if (caseableOffset >= 0) {
+			const rootCharacter = tempRoot[caseableOffset];
+			if (!rootCharacter) throw new Error("Expected a caseable Windows temporary-root character");
+			const alternateCase =
+				rootCharacter === rootCharacter.toUpperCase() ? rootCharacter.toLowerCase() : rootCharacter.toUpperCase();
+			aliasedTempRoot = tempRoot.slice(0, caseableOffset) + alternateCase + tempRoot.slice(caseableOffset + 1);
+			expect(aliasedTempRoot).not.toBe(tempRoot);
+		}
+		const fixture = await signedIdentityFixture("both", false, aliasedTempRoot);
+		const observed = await readFileLockObservationForGc(fixture.lock);
+		if (!observed) throw new Error("Expected a lock observation");
+		expect(await removeFileLockDirForGc(fixture.lock, observed.info, observed.identity)).toBe("removed");
+		expect(fixture.remove).toHaveBeenCalledTimes(1);
+		expect(await fs.exists(fixture.lock)).toBe(false);
+		expect(path.dirname(fixture.lock)).toBe(await fs.realpath(path.dirname(fixture.file)));
+		const cleanup = vi.spyOn(fs, "rm");
+		await cleanupFixtureRoots();
+		expect(cleanup).toHaveBeenCalledTimes(1);
+		expect(cleanup).toHaveBeenCalledWith(path.join(aliasedTempRoot, path.basename(path.dirname(fixture.lock))), {
+			recursive: true,
+			force: true,
+		});
+		expect(await fs.exists(path.dirname(fixture.file))).toBe(false);
+	},
+);
 
 test("canonicalizes the parent and detached root in fallback cleanup", async () => {
 	const fixture = await signedIdentityFixture("both", true);
