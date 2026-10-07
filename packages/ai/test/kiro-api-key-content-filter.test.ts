@@ -1470,6 +1470,44 @@ describe("P1 Regression: content leaking across batches", () => {
 		expect(emittedEvents.filter(event => event.type.startsWith("text_")).length).toBe(0);
 	});
 
+	test("P1: incomplete refusal metadata at EOF discards quarantined content", async () => {
+		const emittedEvents: Array<{ type: string; errorMessage?: string }> = [];
+		const refusal = JSON.stringify({
+			stopReason: "CONTENT_FILTERED",
+			stopDetails: { refusal: { category: "VIOLENCE", explanation: "Filtered" } },
+		});
+
+		globalThis.fetch = (async () => {
+			const encoder = new TextEncoder();
+			let pullCount = 0;
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					pullCount++;
+					if (pullCount === 1) {
+						controller.enqueue(encoder.encode(JSON.stringify({ content: "possibly filtered text" })));
+					} else if (pullCount === 2) {
+						controller.enqueue(encoder.encode(refusal.slice(0, -5)));
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			emittedEvents.push({
+				type: event.type,
+				errorMessage: event.type === "error" ? event.error.errorMessage : undefined,
+			});
+		}
+
+		expect(emittedEvents.filter(event => event.type.startsWith("text_"))).toHaveLength(0);
+		expect(emittedEvents.some(event => event.type === "done")).toBe(false);
+		const error = emittedEvents.find(event => event.type === "error");
+		expect(error?.errorMessage).toContain("incomplete JSON");
+	});
+
 	test("P1: content is suppressed when refusal arrives after multiple response chunks", async () => {
 		const emittedEvents: Array<{ type: string; errorMessage?: string }> = [];
 

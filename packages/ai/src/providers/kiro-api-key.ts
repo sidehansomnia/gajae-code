@@ -1231,6 +1231,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					flushPendingTextEvents();
 				}
 			}
+			if (buffer.length > 0) {
+				throw new Error("Kiro API key stream ended with incomplete JSON data");
+			}
 
 			// Stream is done - add any pending tool, emit accumulated thinking, then deferred text, then close text block
 			// Only emit the tool if it was explicitly completed (has stop flag)
